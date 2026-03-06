@@ -281,6 +281,17 @@ static void ane_attn_set_weights(ANEAttn *a,
     IOSurfaceUnlock(a->kout->ioInputs[0], 0, NULL);
 }
 
+// Chain prev's output to next's input (eliminate CPU roundtrip between layers)
+static void ane_attn_chain(ANEAttn *prev, ANEAttn *next) {
+    IOSurfaceRef y = prev->y_surf;
+    next->x_surf = y;
+    IOSurfaceRef ins[2] = {NULL, y};
+    ane_rewire(next->kq, ins, NULL);
+    ane_rewire(next->kk, ins, NULL);
+    ane_rewire(next->kv, ins, NULL);
+    ane_rewire(next->kadd, ins, NULL);
+}
+
 static void ane_attn_write_x(ANEAttn *a, const _Float16 *x) {
     IOSurfaceLock(a->x_surf, 0, NULL);
     memcpy(IOSurfaceGetBaseAddress(a->x_surf), x, a->C * a->S * sizeof(_Float16));

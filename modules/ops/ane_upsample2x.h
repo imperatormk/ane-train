@@ -15,6 +15,34 @@
 #include <string.h>
 #include <arm_neon.h>
 
+// x[C, H, H] fp16 → y[C, 2H, 2H] fp16, bilinear 2x (aligned corners=False, half-pixel)
+// Maps output pixel i to input position (i+0.5)/2 - 0.5 = (i-0.5)/2.
+// For integer output coords: even→same input pixel, odd→average of adjacent.
+// Edge columns/rows clamp (= replicate padding).
+static void ane_upsample2x_bilinear(const _Float16 *x, _Float16 *y, int C, int H) {
+    int H2 = H * 2;
+    for (int c = 0; c < C; c++) {
+        const _Float16 *xc = x + c * H * H;
+        _Float16 *yc = y + c * H2 * H2;
+        for (int h = 0; h < H; h++) {
+            const _Float16 *row0 = xc + h * H;
+            const _Float16 *row1 = (h + 1 < H) ? xc + (h+1) * H : row0;
+            _Float16 *yr0 = yc + (h*2)   * H2;
+            _Float16 *yr1 = yc + (h*2+1) * H2;
+            for (int w = 0; w < H; w++) {
+                float a = (float)row0[w];
+                float b = (w+1 < H) ? (float)row0[w+1] : a;
+                float c0 = (float)row1[w];
+                float d  = (w+1 < H) ? (float)row1[w+1] : c0;
+                yr0[w*2]   = (_Float16)a;
+                yr0[w*2+1] = (_Float16)(0.5f*(a+b));
+                yr1[w*2]   = (_Float16)(0.5f*(a+c0));
+                yr1[w*2+1] = (_Float16)(0.25f*(a+b+c0+d));
+            }
+        }
+    }
+}
+
 // x[C, H, H] fp16 → y[C, 2H, 2H] fp16, nearest-neighbor 2x
 static void ane_upsample2x(const _Float16 *x, _Float16 *y, int C, int H) {
     int H2 = H * 2;

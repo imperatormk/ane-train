@@ -93,16 +93,24 @@ ane_ln_bwd(const _Float16 *dy, const _Float16 *norm, const _Float16 *rstd,
     }
     #undef LN_BWD_TILE
 
-    // Pre-compute scale[s] = rstd[s] / C (once, reused for all C rows)
+    // Pre-compute scale[s] = min(rstd[s], RSTD_MAX) / C
+    // Cap rstd to avoid LN backward amplifying nearly-constant tokens (std≈0).
     {
+        const float RSTD_MAX = 10.0f;  // clamp rstd: std < 0.1 → cap amplification at 10×
         float32x4_t vinv = vdupq_n_f32(inv_C);
+        float32x4_t vmax = vdupq_n_f32(RSTD_MAX);
         int s = 0;
         for (; s + 7 < S; s += 8) {
             float16x8_t rh = vld1q_f16((const __fp16*)(rstd+s));
-            vst1q_f32(scale+s,   vmulq_f32(vcvt_f32_f16(vget_low_f16(rh)),  vinv));
-            vst1q_f32(scale+s+4, vmulq_f32(vcvt_f32_f16(vget_high_f16(rh)), vinv));
+            float32x4_t lo = vminq_f32(vcvt_f32_f16(vget_low_f16(rh)),  vmax);
+            float32x4_t hi = vminq_f32(vcvt_f32_f16(vget_high_f16(rh)), vmax);
+            vst1q_f32(scale+s,   vmulq_f32(lo, vinv));
+            vst1q_f32(scale+s+4, vmulq_f32(hi, vinv));
         }
-        for (; s < S; s++) scale[s] = (float)rstd[s] * inv_C;
+        for (; s < S; s++) {
+            float r = (float)rstd[s]; if (r > RSTD_MAX) r = RSTD_MAX;
+            scale[s] = r * inv_C;
+        }
     }
 
     // Pass 2: dx[c,s] = scale[s] * (C*dy - sum1 - norm*sum2)

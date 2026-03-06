@@ -116,24 +116,26 @@ static NSString *mil_gen_adam_v(int N, float beta2) {
         N, N, beta2, 1.0f-beta2, N, N, N, N];
 }
 
-// Kernel 3: W_new = W - lr * m_new / sqrt(v_new + eps)
+// Kernel 3: W_new = W*(1-wd) - lr * m_new / sqrt(v_new + eps)  (AdamW)
 // eps >= 1e-4 required for fp16 (1e-8 underflows)
-static NSString *mil_gen_adam_w(int N, float lr, float eps) {
+// wd (weight decay) and eps are baked constants. lr_t is a runtime input [1,N].
+static NSString *mil_gen_adam_w(int N, float eps, float wd) {
     return [NSString stringWithFormat:
         @"program(1.0)\n"
         "[buildInfo = dict<tensor<string, []>, tensor<string, []>>({{\"coremlc-version\", \"3505.4.1\"}})]\n"
         "{\n"
-        "    func main<ios16>(tensor<fp16, [1, %d]> W, tensor<fp16, [1, %d]> mn, tensor<fp16, [1, %d]> vn) {\n"
-        "        tensor<fp16, []> lr_t  = const()[name=tensor<string,[]>(\"lr\"),  val=tensor<fp16,[]>(%.6f)];\n"
-        "        tensor<fp16, []> eps_t = const()[name=tensor<string,[]>(\"eps\"), val=tensor<fp16,[]>(%.6f)];\n"
-        "        tensor<fp16, [1, %d]> ve    = add(x=vn,  y=eps_t)[name=tensor<string,[]>(\"ve\")];\n"
-        "        tensor<fp16, [1, %d]> sv    = sqrt(x=ve)[name=tensor<string,[]>(\"sv\")];\n"
-        "        tensor<fp16, [1, %d]> step  = real_div(x=mn, y=sv)[name=tensor<string,[]>(\"step\")];\n"
-        "        tensor<fp16, [1, %d]> ls    = mul(x=lr_t, y=step)[name=tensor<string,[]>(\"ls\")];\n"
-        "        tensor<fp16, [1, %d]> Wn    = sub(x=W,    y=ls)[name=tensor<string,[]>(\"Wn\")];\n"
+        "    func main<ios16>(tensor<fp16, [1, %d]> W, tensor<fp16, [1, %d]> mn, tensor<fp16, [1, %d]> vn, tensor<fp16, [1, %d]> lr_in) {\n"
+        "        tensor<fp16, []> owd   = const()[name=tensor<string,[]>(\"owd\"),  val=tensor<fp16,[]>(%.6f)];\n"
+        "        tensor<fp16, []> eps_t = const()[name=tensor<string,[]>(\"eps\"),  val=tensor<fp16,[]>(%.6f)];\n"
+        "        tensor<fp16, [1, %d]> Wd   = mul(x=W,    y=owd)[name=tensor<string,[]>(\"Wd\")];\n"
+        "        tensor<fp16, [1, %d]> ve   = add(x=vn,   y=eps_t)[name=tensor<string,[]>(\"ve\")];\n"
+        "        tensor<fp16, [1, %d]> sv   = sqrt(x=ve)[name=tensor<string,[]>(\"sv\")];\n"
+        "        tensor<fp16, [1, %d]> step = real_div(x=mn, y=sv)[name=tensor<string,[]>(\"step\")];\n"
+        "        tensor<fp16, [1, %d]> ls   = mul(x=lr_in, y=step)[name=tensor<string,[]>(\"ls\")];\n"
+        "        tensor<fp16, [1, %d]> Wn   = sub(x=Wd,   y=ls)[name=tensor<string,[]>(\"Wn\")];\n"
         "    } -> (Wn);\n"
         "}\n",
-        N, N, N, lr, eps, N, N, N, N, N];
+        N, N, N, N, 1.0f - wd, eps, N, N, N, N, N, N];
 }
 
 // ============================================================================

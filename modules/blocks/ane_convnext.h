@@ -68,7 +68,8 @@ void _cnx_transpose_sc_cs(const _Float16 *src, _Float16 *dst, int C, int S) {
 }
 
 // NEON-vectorized depthwise KxK same-pad, fp16 in/out, layout [C, H, H]
-// Accumulates in fp32 scratch to avoid K*K fp16 read-modify-write cycles.
+// Row-output-first: compute all K×K contributions per output row, write immediately.
+// Working set = K input rows (~K*H*2B) + 1 output row (H*4B fp32) → fits in L1.
 // Parallel over C — each channel is fully independent.
 #include <dispatch/dispatch.h>
 static void __attribute__((noinline))
@@ -79,43 +80,44 @@ _dw_neon_fp16(const _Float16 *x, const _Float16 *w, _Float16 *y,
         int c = (int)c_;
         const _Float16 *xc = x + c*S;
         _Float16 *yc = y + c*S;
-        // fp32 accumulator for this channel — avoids K*K fp16 RMW cycles
-        float acc_buf[S];
-        memset(acc_buf, 0, (size_t)S * sizeof(float));
-        for (int ky = 0; ky < K; ky++)
-        for (int kx = 0; kx < K; kx++) {
-            float wv = (float)w[c*K*K + ky*K + kx];
-            float32x4_t vw = vdupq_n_f32(wv);
-            for (int oh = 0; oh < H; oh++) {
+        float acc_row[H];  // single row fp32 accumulator
+        // Pre-load all K*K weights into fp32
+        float wf[K*K];
+        for (int i = 0; i < K*K; i++) wf[i] = (float)w[c*K*K + i];
+
+        for (int oh = 0; oh < H; oh++) {
+            memset(acc_row, 0, (size_t)H * sizeof(float));
+            for (int ky = 0; ky < K; ky++) {
                 int ih = oh + ky - pad;
                 if (ih < 0 || ih >= H) continue;
-                int dx = kx - pad;
-                int ow_start = (-dx > 0) ? -dx : 0;
-                int ow_end = (H - dx < H) ? H - dx : H;
-                int ow = ow_start;
-                float *ac = acc_buf + oh*H;
-                for (; ow + 7 < ow_end; ow += 8) {
-                    int iw = ow + dx;
-                    float16x8_t xh = vld1q_f16((const __fp16*)(xc + ih*H + iw));
-                    float32x4_t xl = vcvt_f32_f16(vget_low_f16(xh));
-                    float32x4_t xhi = vcvt_f32_f16(vget_high_f16(xh));
-                    vst1q_f32(ac+ow,   vfmaq_f32(vld1q_f32(ac+ow),   xl,  vw));
-                    vst1q_f32(ac+ow+4, vfmaq_f32(vld1q_f32(ac+ow+4), xhi, vw));
-                }
-                for (; ow < ow_end; ow++) {
-                    int iw = ow + dx;
-                    ac[ow] += wv * (float)xc[ih*H + iw];
+                const _Float16 *xrow = xc + ih*H;
+                for (int kx = 0; kx < K; kx++) {
+                    float wv = wf[ky*K + kx];
+                    float32x4_t vw = vdupq_n_f32(wv);
+                    int dx = kx - pad;
+                    int ow_start = (-dx > 0) ? -dx : 0;
+                    int ow_end = (H - dx < H) ? H - dx : H;
+                    int ow = ow_start;
+                    for (; ow + 7 < ow_end; ow += 8) {
+                        float16x8_t xh = vld1q_f16((const __fp16*)(xrow + ow + dx));
+                        float32x4_t xl = vcvt_f32_f16(vget_low_f16(xh));
+                        float32x4_t xhi = vcvt_f32_f16(vget_high_f16(xh));
+                        vst1q_f32(acc_row+ow,   vfmaq_f32(vld1q_f32(acc_row+ow),   xl,  vw));
+                        vst1q_f32(acc_row+ow+4, vfmaq_f32(vld1q_f32(acc_row+ow+4), xhi, vw));
+                    }
+                    for (; ow < ow_end; ow++)
+                        acc_row[ow] += wv * (float)xrow[ow + dx];
                 }
             }
+            // Write fp32 → fp16 immediately
+            _Float16 *yr = yc + oh*H;
+            int ow = 0;
+            for (; ow + 7 < H; ow += 8)
+                vst1q_f16((__fp16*)(yr+ow),
+                    vcombine_f16(vcvt_f16_f32(vld1q_f32(acc_row+ow)),
+                                 vcvt_f16_f32(vld1q_f32(acc_row+ow+4))));
+            for (; ow < H; ow++) yr[ow] = (_Float16)acc_row[ow];
         }
-        // Convert fp32 accumulator → fp16 output (one pass)
-        int s = 0;
-        for (; s + 7 < S; s += 8) {
-            vst1q_f16((__fp16*)(yc+s),
-                vcombine_f16(vcvt_f16_f32(vld1q_f32(acc_buf+s)),
-                             vcvt_f16_f32(vld1q_f32(acc_buf+s+4))));
-        }
-        for (; s < S; s++) yc[s] = (_Float16)acc_buf[s];
     });
 }
 
@@ -235,7 +237,7 @@ static double _cnxf_now_ms(void){struct timespec ts;clock_gettime(CLOCK_MONOTONI
 static int _cnxf_profile_step = 0;
 
 static void ane_convnext_eval(ANEConvNeXt *blk, int H) {
-    int _p = (++_cnxf_profile_step == 2 && blk->C == 96 && blk->S == 16384);
+    int _p = 0; ++_cnxf_profile_step;
     double _t0, _t1;
 #define _CFT(label) if(_p){_t1=_cnxf_now_ms();printf("    fwd_cnx %-16s %.1f ms\n",label,_t1-_t0);_t0=_t1;}
     if(_p) _t0=_cnxf_now_ms();

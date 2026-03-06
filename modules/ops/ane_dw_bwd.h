@@ -16,8 +16,8 @@
 #include <string.h>
 #include <dispatch/dispatch.h>
 
-// Backward dx: full conv with flipped kernel. Parallel over C (channels independent).
-// Accumulates in fp32 scratch to avoid K*K fp16 read-modify-write cycles.
+// Backward dx: full conv with flipped kernel. Row-output-first for L1 cache locality.
+// Parallel over C (channels independent).
 static void __attribute__((noinline))
 _dw_neon_bwd_dx(const _Float16 *dy, const _Float16 *w, _Float16 *dx,
                 int C, int H, int K) {
@@ -26,42 +26,48 @@ _dw_neon_bwd_dx(const _Float16 *dy, const _Float16 *w, _Float16 *dx,
         int c = (int)c_;
         const _Float16 *dyc = dy + c*S;
         _Float16 *dxc = dx + c*S;
-        float acc_buf[S];
-        memset(acc_buf, 0, (size_t)S * sizeof(float));
-        for (int ky = 0; ky < K; ky++)
-        for (int kx = 0; kx < K; kx++) {
-            float wv = (float)w[c*K*K + (K-1-ky)*K + (K-1-kx)];
-            float32x4_t vw = vdupq_n_f32(wv);
-            for (int ih = 0; ih < H; ih++) {
+        float acc_row[H];
+        // Pre-load flipped weights
+        float wf[K*K];
+        for (int i = 0; i < K; i++)
+            for (int j = 0; j < K; j++)
+                wf[i*K+j] = (float)w[c*K*K + (K-1-i)*K + (K-1-j)];
+
+        for (int ih = 0; ih < H; ih++) {
+            memset(acc_row, 0, (size_t)H * sizeof(float));
+            for (int ky = 0; ky < K; ky++) {
                 int oh = ih - (ky - pad);
                 if (oh < 0 || oh >= H) continue;
-                int dx_shift = kx - pad;
-                int iw_start = (dx_shift > 0) ? dx_shift : 0;
-                int iw_end   = (H + dx_shift < H) ? H + dx_shift : H;
-                int iw = iw_start;
-                float *ac = acc_buf + ih*H;
-                for (; iw + 7 < iw_end; iw += 8) {
-                    int ow = iw - dx_shift;
-                    float16x8_t dyh = vld1q_f16((const __fp16*)(dyc + oh*H + ow));
-                    float32x4_t dyl = vcvt_f32_f16(vget_low_f16(dyh));
-                    float32x4_t dyhi = vcvt_f32_f16(vget_high_f16(dyh));
-                    vst1q_f32(ac+iw,   vfmaq_f32(vld1q_f32(ac+iw),   dyl,  vw));
-                    vst1q_f32(ac+iw+4, vfmaq_f32(vld1q_f32(ac+iw+4), dyhi, vw));
-                }
-                for (; iw < iw_end; iw++) {
-                    int ow = iw - dx_shift;
-                    ac[iw] += wv * (float)dyc[oh*H + ow];
+                const _Float16 *dyrow = dyc + oh*H;
+                for (int kx = 0; kx < K; kx++) {
+                    float wv = wf[ky*K + kx];
+                    float32x4_t vw = vdupq_n_f32(wv);
+                    int dx_shift = kx - pad;
+                    int iw_start = (dx_shift > 0) ? dx_shift : 0;
+                    int iw_end   = (H + dx_shift < H) ? H + dx_shift : H;
+                    int iw = iw_start;
+                    for (; iw + 7 < iw_end; iw += 8) {
+                        int ow = iw - dx_shift;
+                        float16x8_t dyh = vld1q_f16((const __fp16*)(dyrow + ow));
+                        float32x4_t dyl = vcvt_f32_f16(vget_low_f16(dyh));
+                        float32x4_t dyhi = vcvt_f32_f16(vget_high_f16(dyh));
+                        vst1q_f32(acc_row+iw,   vfmaq_f32(vld1q_f32(acc_row+iw),   dyl,  vw));
+                        vst1q_f32(acc_row+iw+4, vfmaq_f32(vld1q_f32(acc_row+iw+4), dyhi, vw));
+                    }
+                    for (; iw < iw_end; iw++) {
+                        int ow = iw - dx_shift;
+                        acc_row[iw] += wv * (float)dyrow[ow];
+                    }
                 }
             }
+            _Float16 *dxr = dxc + ih*H;
+            int iw = 0;
+            for (; iw + 7 < H; iw += 8)
+                vst1q_f16((__fp16*)(dxr+iw),
+                    vcombine_f16(vcvt_f16_f32(vld1q_f32(acc_row+iw)),
+                                 vcvt_f16_f32(vld1q_f32(acc_row+iw+4))));
+            for (; iw < H; iw++) dxr[iw] = (_Float16)acc_row[iw];
         }
-        // Convert fp32 → fp16 output
-        int s = 0;
-        for (; s + 7 < S; s += 8) {
-            vst1q_f16((__fp16*)(dxc+s),
-                vcombine_f16(vcvt_f16_f32(vld1q_f32(acc_buf+s)),
-                             vcvt_f16_f32(vld1q_f32(acc_buf+s+4))));
-        }
-        for (; s < S; s++) dxc[s] = (_Float16)acc_buf[s];
     });
 }
 

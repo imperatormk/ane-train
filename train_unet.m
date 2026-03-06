@@ -18,6 +18,38 @@ static double now_ms(void) {
     return ts.tv_sec*1e3 + ts.tv_nsec*1e-6;
 }
 
+// Save side-by-side tile: [GT | Pred], each H×H grayscale → H×(2H) wide PNG
+static void save_pred_png(const _Float16 *pred, const _Float16 *gt, int H,
+                          int step, NSString *run_dir) {
+    int S = H * H;
+    int W = 2 * H;
+    uint8_t *buf = malloc(H * W);
+    // Left: GT
+    for (int i = 0; i < S; i++) {
+        float v = (float)gt[i];
+        if (v < 0) v = 0; if (v > 1) v = 1;
+        int row = i / H, col = i % H;
+        buf[row * W + col] = (uint8_t)(v * 255.0f);
+    }
+    // Right: Pred
+    for (int i = 0; i < S; i++) {
+        float v = (float)pred[i];
+        if (v < 0) v = 0; if (v > 1) v = 1;
+        int row = i / H, col = i % H;
+        buf[row * W + H + col] = (uint8_t)(v * 255.0f);
+    }
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:NULL pixelsWide:W pixelsHigh:H
+        bitsPerSample:8 samplesPerPixel:1 hasAlpha:NO isPlanar:NO
+        colorSpaceName:NSDeviceWhiteColorSpace bytesPerRow:W bitsPerPixel:8];
+    memcpy(rep.bitmapData, buf, H * W);
+    free(buf);
+    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    NSString *path = [run_dir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"pred_%04d.png", step]];
+    [png writeToFile:path atomically:YES];
+}
+
 int main(void) {
     @autoreleasepool {
 
@@ -26,9 +58,13 @@ int main(void) {
     const int H = 256;
     // UNet architecture: depths=[4,6,10,4,4], 6× global attn
     const int nB1 = 4, nB2 = 6, nB3 = 10, nB4 = 4, nB5 = 4, nA = 6;
-    const int NSTEPS = 200;
-    const float LR = 1e-4f;
-    const int LOG_EVERY = 10;
+    const int NEPOCHS = 20;
+    const float LR_MAX = 1e-4f;
+    const float LR_MIN = 1e-5f;
+    const int WARMUP_EPOCHS = 3;  // linear warmup over first 3 epochs (like PyTorch)
+    const int LOG_EVERY = 20;
+
+    const float loss_scale = 512.0f;
 
     int S0 = H * H;
 
@@ -39,19 +75,11 @@ int main(void) {
     if (npairs == 0) { printf("No pairs! Check data_root.\n"); return 1; }
 
     float *rgb_f32   = malloc(3 * H * H * sizeof(float));
-    float *mask_f32 = malloc(1 * H * H * sizeof(float));
+    float *mask_f32  = malloc(1 * H * H * sizeof(float));
     _Float16 *rgb_f16   = malloc(3 * H * H * sizeof(_Float16));
-    _Float16 *mask_f16 = malloc(1 * H * H * sizeof(_Float16));
+    _Float16 *mask_f16  = malloc(1 * H * H * sizeof(_Float16));
     _Float16 *pred_f16  = malloc(S0 * sizeof(_Float16));
-
-    // Load sample 0 once (overfit test)
-    printf("Loading sample 0: %s\n", pairs[0].img);
-    if (!load_png(pairs[0].img, 3, H, H, rgb_f32)) return 1;
-    if (!load_png(pairs[0].mask, 1, H, H, mask_f32)) return 1;
-    f32_to_f16(rgb_f32,   rgb_f16,   3 * H * H);
-    f32_to_f16(mask_f32, mask_f16, 1 * H * H);
-    { float sr=0, sa=0; for (int i=0; i<H*H; i++) { sr+=(float)rgb_f16[i]; sa+=(float)mask_f16[i]; }
-      printf("  rgb mean=%.3f  mask mean=%.3f\n", sr/(H*H), sa/(H*H)); }
+    printf("Training on %d pairs\n", npairs);
 
     // ---- Compile UNet ----
     printf("\nCompiling Large UNet H=%d nB1=%d nB2=%d nB3=%d nB4=%d nB5=%d nA=%d...\n",
@@ -67,32 +95,94 @@ int main(void) {
     ane_unet_large_set_weights(net, &w);
 
     t0 = now_ms();
-    ANEUNetLargeBwd *bwd = ane_unet_large_bwd_compile(net, LR, 0.9f, 0.999f, 1e-8f, /*checkpointed=*/0);
+    ANEUNetLargeBwd *bwd = ane_unet_large_bwd_compile(net, LR_MAX, 0.9f, 0.999f, 1e-8f, /*wd=*/0.001f, /*checkpointed=*/0);
     if (!bwd) { printf("UNetLargeBwd compile FAILED\n"); return 1; }
     printf("  bwd compile: %.0f ms\n", now_ms()-t0);
+    ane_unet_large_set_dw_clip(bwd, 1000.0f);  // gradient clipping: cap |dW| per element
+
+    // ---- Run dir ----
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyyMMdd_HHmmss";
+    NSString *run_dir = [NSString stringWithFormat:@"runs/%@", [fmt stringFromDate:[NSDate date]]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:run_dir
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    printf("Saving predictions to %s/\n", run_dir.UTF8String);
+
+    // ---- Shuffle indices (Fisher-Yates) ----
+    int *order = malloc(npairs * sizeof(int));
+    for (int i = 0; i < npairs; i++) order[i] = i;
 
     // ---- Training loop ----
-    printf("\nTraining %d steps (overfit on sample 0, lr=%.1e)...\n", NSTEPS, LR);
-    printf("%-6s  %-10s  %-8s  %-8s  %-8s  %-8s\n", "step", "loss", "fwd_ms", "save_ms", "bwd_ms", "total_ms");
+    int warmup_steps = WARMUP_EPOCHS * npairs;
+    int total_steps  = NEPOCHS * npairs;
+    printf("\nTraining %d epochs × %d pairs = %d steps (lr %.1e→%.1e cosine, %d warmup steps)...\n",
+           NEPOCHS, npairs, total_steps, LR_MAX, LR_MIN, warmup_steps);
+    printf("%-6s  %-4s  %-10s  %-8s  %-8s  %-8s  %-8s\n",
+           "step", "ep", "loss", "fwd_ms", "save_ms", "bwd_ms", "total_ms");
+    printf("  (loss_scale=%.0f)\n", loss_scale);
 
-    for (int step = 1; step <= NSTEPS; step++) {
-        double t0 = now_ms();
-
-        ane_unet_large_eval(net, rgb_f16);
-        double t1 = now_ms();
-
-        ane_unet_large_read_output(net, pred_f16);
-        ane_unet_large_bwd_save_fwd(bwd, net, H);
-        double t2 = now_ms();
-
-        float loss = ane_unet_large_bwd_eval(bwd, net, pred_f16, mask_f16, step);
-        double t3 = now_ms();
-
-        if ((step >= 2 && step <= 20) || step % LOG_EVERY == 0) {
-            printf("%-6d  %-10.4f  %-8.1f  %-8.1f  %-8.1f  %-8.1f\n",
-                   step, loss, t1-t0, t2-t1, t3-t2, t3-t0);
+    int step = 0;
+    for (int epoch = 0; epoch < NEPOCHS; epoch++) {
+        // Shuffle for this epoch — seeded by epoch for reproducibility
+        srand(42 + epoch);
+        for (int i = npairs - 1; i > 0; i--) {
+            int j = rand() % (i + 1);
+            int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
         }
+
+        for (int ei = 0; ei < npairs; ei++) {
+            step++;
+            double t0 = now_ms();
+
+            int idx = order[ei];
+            if (!load_png(pairs[idx].img,  3, H, H, rgb_f32))  continue;
+            if (!load_png(pairs[idx].mask, 1, H, H, mask_f32)) continue;
+            f32_to_f16(rgb_f32,  rgb_f16,  3 * H * H);
+            f32_to_f16(mask_f32, mask_f16, 1 * H * H);
+
+            ane_unet_large_eval(net, rgb_f16);
+            double t1 = now_ms();
+
+            ane_unet_large_read_output(net, pred_f16);
+            ane_unet_large_bwd_save_fwd(bwd, net, H);
+            double t2 = now_ms();
+
+            // Cosine LR with linear warmup (epoch-based, like PyTorch)
+            float lr_t;
+            if (step <= warmup_steps) {
+                lr_t = LR_MAX * (float)step / (float)warmup_steps;
+            } else {
+                float progress = (float)(step - warmup_steps) / (float)(total_steps - warmup_steps);
+                lr_t = LR_MIN + 0.5f * (LR_MAX - LR_MIN) * (1.0f + cosf(M_PI * progress));
+            }
+            ane_unet_large_set_lr(bwd, lr_t, step);
+
+            int overflow = 0;
+            float loss = ane_unet_large_bwd_eval(bwd, net, pred_f16, mask_f16, step,
+                                                  loss_scale, &overflow);
+            double t3 = now_ms();
+
+            // Detect loss spike (>3× previous) for diagnostics
+            static float prev_loss = 0.f;
+            int spike = prev_loss > 0.f && loss > prev_loss * 3.0f;
+            if (!overflow) prev_loss = loss;
+
+            if (spike)
+                ane_unet_large_print_spike_diag(bwd, net, step);
+
+            int log_step = (epoch == 0 && ei < 20) || step % LOG_EVERY == 0 || spike || overflow;
+            if (log_step) {
+                printf("%-6d  %-4d  %-10.4f  %-8.1f  %-8.1f  %-8.1f  %-8.1f  lr=%.2e%s%s\n",
+                       step, epoch+1, loss, t1-t0, t2-t1, t3-t2, t3-t0, lr_t,
+                       overflow ? " SKIP" : "",
+                       spike    ? " SPIKE" : "");
+            }
+            if (step % 100 == 0)
+                save_pred_png(pred_f16, mask_f16, H, step, run_dir);
+        }
+        printf("-- epoch %d done, step %d --\n", epoch+1, step);
     }
+    free(order);
 
     printf("\nDone.\n");
     free(rgb_f32); free(mask_f32);

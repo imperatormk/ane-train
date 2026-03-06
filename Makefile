@@ -15,4 +15,6 @@ train_unet_asan: train_unet.m ane_runtime.h data_utils.h \
 clean:
 	rm -f train_unet train_unet_asan
 
-.PHONY: clean
+asan: train_unet_asan
+
+.PHONY: clean asan

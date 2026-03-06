@@ -2,3 +2,18 @@ train_unet
 train_unet_asan
 train_unet_asan.dSYM/
 *.o
+runs/
+.DS_Store
+# compiled probe/test binaries (no extension)
+probe2
+probe3
+probe_adam_lr
+modules/test_bwd
+modules/test_bwd.dSYM/
+modules/test_modules
+modules/test_modules.dSYM/
+modules/test_modules_dbg
+modules/test_modules_dbg.dSYM/
+modules/test_modules_o1
+modules/test_unet_bwd
+modules/test_unet_bwd.dSYM/

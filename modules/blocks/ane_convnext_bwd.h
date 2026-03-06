@@ -80,17 +80,17 @@ typedef struct {
 } ANEConvNeXtBwd;
 
 static ANEConvNeXtBwd *ane_convnext_bwd_compile_ex(ANEConvNeXt *fwd,
-                                                     float lr, float beta1, float beta2, float eps,
-                                                     int checkpointed);
+                                                     float lr, float beta1, float beta2, float eps, float wd,
+                                                     int checkpointed, IOSurfaceRef shared_lr_surf);
 
 static ANEConvNeXtBwd *ane_convnext_bwd_compile(ANEConvNeXt *fwd,
-                                                  float lr, float beta1, float beta2, float eps) {
-    return ane_convnext_bwd_compile_ex(fwd, lr, beta1, beta2, eps, 0);
+                                                  float lr, float beta1, float beta2, float eps, float wd) {
+    return ane_convnext_bwd_compile_ex(fwd, lr, beta1, beta2, eps, wd, 0, NULL);
 }
 
 static ANEConvNeXtBwd *ane_convnext_bwd_compile_ex(ANEConvNeXt *fwd,
-                                                     float lr, float beta1, float beta2, float eps,
-                                                     int checkpointed) {
+                                                     float lr, float beta1, float beta2, float eps, float wd,
+                                                     int checkpointed, IOSurfaceRef shared_lr_surf) {
     int C = fwd->C, S = fwd->S, K = fwd->K;
     ANEConvNeXtBwd *bwd = (ANEConvNeXtBwd *)calloc(1, sizeof(ANEConvNeXtBwd));
     bwd->C = C; bwd->S = S; bwd->K = K;
@@ -164,11 +164,11 @@ static ANEConvNeXtBwd *ane_convnext_bwd_compile_ex(ANEConvNeXt *fwd,
         }
     }
 
-    // Optimizers
-    bwd->opt_pw1 = ane_adam_compile(C * C*4, lr, beta1, beta2, eps);
-    bwd->opt_pw2 = ane_adam_compile(C * C*4, lr, beta1, beta2, eps);
-    // dw optimizer is CPU-side (small: C*K*K elements)
-    bwd->opt_dw  = ane_adam_compile(C * K*K, lr, beta1, beta2, eps);
+    // Optimizers — share lr_surf if provided (single write per step)
+    bwd->opt_pw1 = ane_adam_compile_ex(C * C*4, lr, beta1, beta2, eps, wd, shared_lr_surf);
+    bwd->opt_pw2 = ane_adam_compile_ex(C * C*4, lr, beta1, beta2, eps, wd, shared_lr_surf);
+    // dw optimizer is CPU-side (small: C*K*K elements) — no lr_surf needed
+    bwd->opt_dw  = ane_adam_compile(C * K*K, lr, beta1, beta2, eps, wd);
 
     if (!bwd->opt_pw1 || !bwd->opt_pw2 || !bwd->opt_dw) {
         fprintf(stderr, "ane_convnext_bwd_compile adam FAILED\n");
@@ -230,6 +230,26 @@ static void ane_convnext_save_fwd(ANEConvNeXtBwd *bwd, ANEConvNeXt *fwd, int H) 
     // dw_out_saved: not used in backward — skip.
 }
 
+// ---- Deferred dW/Adam work (overlaps with next block's dx computation) ----
+#include <dispatch/dispatch.h>
+
+static dispatch_queue_t _cnx_deferred_q = NULL;
+static dispatch_group_t _cnx_deferred_g = NULL;
+
+static void _cnx_deferred_init(void) {
+    if (!_cnx_deferred_q) {
+        _cnx_deferred_q = dispatch_queue_create("ane.cnx.deferred", DISPATCH_QUEUE_SERIAL);
+        _cnx_deferred_g = dispatch_group_create();
+    }
+}
+
+// Wait for all deferred dW/Adam work to complete.
+// Must be called before the next forward pass (which reads updated weights).
+static void ane_convnext_bwd_drain(void) {
+    if (_cnx_deferred_g)
+        dispatch_group_wait(_cnx_deferred_g, DISPATCH_TIME_FOREVER);
+}
+
 // Run backward pass. dy[C,S] is gradient from above. dx[C,S] receives gradient to pass below.
 // t = current Adam step (1-indexed).
 static double _cnx_now_ms(void){struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return ts.tv_sec*1e3+ts.tv_nsec*1e-6;}
@@ -237,7 +257,8 @@ static double _cnx_now_ms(void){struct timespec ts;clock_gettime(CLOCK_MONOTONIC
 static void ane_convnext_bwd_eval(ANEConvNeXtBwd *bwd, ANEConvNeXt *fwd,
                                    const _Float16 *dy, _Float16 *dx, int H, int t) {
     int C = bwd->C, S = bwd->S, K = bwd->K;
-    int _p = (t==2 && C==96 && S==16384);
+    static int _cnx_step = 0; ++_cnx_step;
+    int _p = 0;  // set to (_cnx_step <= 28) for per-block timing
     double _t0, _t1;
 #define _CT(label) if(_p){_t1=_cnx_now_ms();printf("    cnx %-20s %.1f ms\n",label,_t1-_t0);_t0=_t1;}
     if(_p) _t0=_cnx_now_ms();
@@ -255,33 +276,26 @@ static void ane_convnext_bwd_eval(ANEConvNeXtBwd *bwd, ANEConvNeXt *fwd,
     }
     if(_p){_CT("recompute_fwd");}
 
-    // 1-3. Pointwise dx chain: pw2_dx + silu_bwd + pw1_dx
+    // 1. Pointwise dx (critical path — produces d_pw1_dx for LN2 bwd)
     if (bwd->fused_dx) {
-        // Fused path: 1 ANE dispatch for dx + d_silu
         ane_fused_pw_bwd_write_dy(bwd->fused_dx, dy);
         ane_fused_pw_bwd_eval(bwd->fused_dx);
         ane_fused_pw_bwd_read_dx(bwd->fused_dx, bwd->d_pw1_dx);
         if(_p){_CT("fused_pw_dx");}
-        // dW kernels: pw2_dw needs (dy, silu(pw1_out)), pw1_dw needs (d_silu, pw1_x)
+
+        // 2. dW kernels: setup IO on main thread, defer ane_eval to overlap with NEON below
         if (bwd->fused_silu_dw) {
-            // Fused: silu recomputed from pw1->y_surf inside kernel
             IOSurfaceLock(bwd->fused_silu_dw->dy_surf, 0, NULL);
             memcpy(IOSurfaceGetBaseAddress(bwd->fused_silu_dw->dy_surf), dy, C*S*sizeof(_Float16));
             IOSurfaceUnlock(bwd->fused_silu_dw->dy_surf, 0, NULL);
-            ane_fused_silu_dw_eval(bwd->fused_silu_dw);
         } else {
-            // Original: pw2_dw with pre-computed silu output
             ane_matmul_bwd_write_dy(bwd->pw2_bwd, dy);
             ane_matmul_bwd_rewire_x(bwd->pw2_bwd, fwd->pw2->x_surf);
-            ane_eval(bwd->pw2_bwd->k_dw);
         }
-        if(_p){_CT("pw2_dw");}
-        // pw1_dw: d_silu wired at compile time, just need x
         ane_matmul_bwd_rewire_x(bwd->pw1_bwd, fwd->pw1->x_surf);
-        ane_eval(bwd->pw1_bwd->k_dw);
-        if(_p){_CT("pw1_dw");}
+        // pw2_dw + pw1_dw eval deferred into the async block below
     } else {
-        // Fallback: 3 separate dispatches for dx chain
+        // Fallback: 3 separate dispatches for dx chain (not deferred — rare path)
         ane_matmul_bwd_write_dy(bwd->pw2_bwd, dy);
         ane_matmul_bwd_rewire_x(bwd->pw2_bwd, fwd->pw2->x_surf);
         ane_matmul_bwd_eval(bwd->pw2_bwd);
@@ -310,8 +324,7 @@ static void ane_convnext_bwd_eval(ANEConvNeXtBwd *bwd, ANEConvNeXt *fwd,
     // d_ln2 is in [C,S] layout, dw operates in [C,H,H]
     _dw_neon_bwd_dx(bwd->d_ln2, fwd->dw_w, bwd->d_dw_dx, C, H, K);
     if(_p){_CT("dw_bwd_dx");}
-    _dw_neon_bwd_dw(bwd->d_ln2, bwd->dw_in_saved, bwd->d_dw_dw, C, H, K);
-    if(_p){_CT("dw_bwd_dw");}
+    // dw_bwd_dw deferred — only needed by Adam, not on dx critical path
 
     // 6. LN1 backward: d_dw_dx[C,S] → dx_block[C,S]
     ane_ln_bwd(bwd->d_dw_dx, bwd->ln1_norm, bwd->ln1_rstd, bwd->d_ln1, C, S);
@@ -330,31 +343,46 @@ static void ane_convnext_bwd_eval(ANEConvNeXtBwd *bwd, ANEConvNeXt *fwd,
             dx[i] = (_Float16)((float)a[i] + (float)b[i]);
     }
     if(_p){_CT("residual_add");}
+    // --- dx done. Next block can start. ---
 
-    // 8. Adam weight updates
-    // pw1: dW already in bwd->pw1_bwd->dw_surf (wired to optimizer)
-    ane_adam_step(bwd->opt_pw1, t);
-    ane_adam_step(bwd->opt_pw2, t);
-    if(_p){_CT("adam_pw1+pw2");}
+    // 8. Deferred: dW computation + Adam + weight ping-pong.
+    // These only update weights for the NEXT forward pass, so they can
+    // run concurrently with the next block's dx computation.
+    _cnx_deferred_init();
+    // Wait for previous deferred block (serial queue ensures ordering)
+    int _has_fused = (bwd->fused_dx != NULL);
+    dispatch_group_async(_cnx_deferred_g, _cnx_deferred_q, ^{
+        // pw2_dw + pw1_dw: ANE evals (IO already set up on main thread)
+        if (_has_fused) {
+            if (bwd->fused_silu_dw) {
+                ane_fused_silu_dw_eval(bwd->fused_silu_dw);
+            } else {
+                ane_eval(bwd->pw2_bwd->k_dw);
+            }
+            ane_eval(bwd->pw1_bwd->k_dw);
+        }
 
-    // dw: CPU Adam (small: C*K*K)
-    // Write d_dw_dw to opt_dw->dw_surf, W_dw to opt_dw->w_surf
-    IOSurfaceLock(bwd->opt_dw->dw_surf, 0, NULL);
-    memcpy(IOSurfaceGetBaseAddress(bwd->opt_dw->dw_surf), bwd->d_dw_dw,
-           (size_t)C * K*K * 2);
-    IOSurfaceUnlock(bwd->opt_dw->dw_surf, 0, NULL);
-    IOSurfaceLock(bwd->opt_dw->w_surf, 0, NULL);
-    memcpy(IOSurfaceGetBaseAddress(bwd->opt_dw->w_surf), fwd->dw_w, (size_t)C * K*K * 2);
-    IOSurfaceUnlock(bwd->opt_dw->w_surf, 0, NULL);
-    ane_adam_step(bwd->opt_dw, t);
-    // Read updated dw weights back to fwd->dw_w
-    IOSurfaceLock(bwd->opt_dw->w_new_surf, kIOSurfaceLockReadOnly, NULL);
-    memcpy(fwd->dw_w, IOSurfaceGetBaseAddress(bwd->opt_dw->w_new_surf), (size_t)C * K*K * 2);
-    IOSurfaceUnlock(bwd->opt_dw->w_new_surf, kIOSurfaceLockReadOnly, NULL);
+        // dw_bwd_dw: compute dW for depthwise (reads d_ln2 + dw_in_saved, both per-block)
+        _dw_neon_bwd_dw(bwd->d_ln2, bwd->dw_in_saved, bwd->d_dw_dw, C, H, K);
 
-    // pw1/pw2: update fwd weights from Adam output.
-    // ANE path: ping-pong surfaces (no memcpy).
-    // CPU path: must memcpy w_new_surf → fwd->pw1->w_surf.
+        // pw1/pw2 Adam (CPU NEON for large weights)
+        ane_adam_step(bwd->opt_pw1, t);
+        ane_adam_step(bwd->opt_pw2, t);
+
+        // dw: write dW + current W to Adam surfs, step, read back
+        IOSurfaceLock(bwd->opt_dw->dw_surf, 0, NULL);
+        memcpy(IOSurfaceGetBaseAddress(bwd->opt_dw->dw_surf), bwd->d_dw_dw,
+               (size_t)C * K*K * 2);
+        IOSurfaceUnlock(bwd->opt_dw->dw_surf, 0, NULL);
+        IOSurfaceLock(bwd->opt_dw->w_surf, 0, NULL);
+        memcpy(IOSurfaceGetBaseAddress(bwd->opt_dw->w_surf), fwd->dw_w, (size_t)C * K*K * 2);
+        IOSurfaceUnlock(bwd->opt_dw->w_surf, 0, NULL);
+        ane_adam_step(bwd->opt_dw, t);
+        IOSurfaceLock(bwd->opt_dw->w_new_surf, kIOSurfaceLockReadOnly, NULL);
+        memcpy(fwd->dw_w, IOSurfaceGetBaseAddress(bwd->opt_dw->w_new_surf), (size_t)C * K*K * 2);
+        IOSurfaceUnlock(bwd->opt_dw->w_new_surf, kIOSurfaceLockReadOnly, NULL);
+
+        // pw1/pw2: ping-pong weight surfaces
 #define _PINGPONG_W(opt, fwd_mm, bwd_mm) do { \
     if (!(opt)->cpu_mode) { \
         IOSurfaceRef _wu = (opt)->w_new_surf, _ws = (opt)->w_surf; \
@@ -374,29 +402,26 @@ static void ane_convnext_bwd_eval(ANEConvNeXtBwd *bwd, ANEConvNeXt *fwd,
         IOSurfaceUnlock((opt)->w_new_surf, kIOSurfaceLockReadOnly, NULL); \
     } \
 } while(0)
-
-    _PINGPONG_W(bwd->opt_pw1, fwd->pw1, bwd->pw1_bwd);
-    _PINGPONG_W(bwd->opt_pw2, fwd->pw2, bwd->pw2_bwd);
-    // Re-wire fused kernel weight inputs after ping-pong
-    if (bwd->fused_dx) {
-        IOSurfaceRef fins[4] = {fwd->pw2->w_surf, fwd->pw1->w_surf, NULL, NULL};
-        ane_rewire(bwd->fused_dx->k, fins, NULL);
-        bwd->fused_dx->w_pw2_surf = fwd->pw2->w_surf;
-        bwd->fused_dx->w_pw1_surf = fwd->pw1->w_surf;
-    }
-    // Re-wire fused_all or fused_spa W after ping-pong
-    if (fwd->fused_all) {
-        IOSurfaceRef fins[4] = {fwd->pw1->w_surf, fwd->pw2->w_surf, NULL, NULL};
-        ane_rewire(fwd->fused_all->k, fins, NULL);
-        fwd->fused_all->w_pw1_surf = fwd->pw1->w_surf;
-        fwd->fused_all->w_pw2_surf = fwd->pw2->w_surf;
-    }
-    if (fwd->fused_spa) {
-        IOSurfaceRef spins[3] = {fwd->pw2->w_surf, NULL, NULL};
-        ane_rewire(fwd->fused_spa->k, spins, NULL);
-        fwd->fused_spa->w_surf = fwd->pw2->w_surf;
-    }
-    if(_p){_CT("pingpong+dw_adam");}
+        _PINGPONG_W(bwd->opt_pw1, fwd->pw1, bwd->pw1_bwd);
+        _PINGPONG_W(bwd->opt_pw2, fwd->pw2, bwd->pw2_bwd);
+        if (bwd->fused_dx) {
+            IOSurfaceRef fins[4] = {fwd->pw2->w_surf, fwd->pw1->w_surf, NULL, NULL};
+            ane_rewire(bwd->fused_dx->k, fins, NULL);
+            bwd->fused_dx->w_pw2_surf = fwd->pw2->w_surf;
+            bwd->fused_dx->w_pw1_surf = fwd->pw1->w_surf;
+        }
+        if (fwd->fused_all) {
+            IOSurfaceRef fins[4] = {fwd->pw1->w_surf, fwd->pw2->w_surf, NULL, NULL};
+            ane_rewire(fwd->fused_all->k, fins, NULL);
+            fwd->fused_all->w_pw1_surf = fwd->pw1->w_surf;
+            fwd->fused_all->w_pw2_surf = fwd->pw2->w_surf;
+        }
+        if (fwd->fused_spa) {
+            IOSurfaceRef spins[3] = {fwd->pw2->w_surf, NULL, NULL};
+            ane_rewire(fwd->fused_spa->k, spins, NULL);
+            fwd->fused_spa->w_surf = fwd->pw2->w_surf;
+        }
 #undef _PINGPONG_W
+    });
 #undef _CT
 }
